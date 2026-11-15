@@ -12,6 +12,8 @@ import webbrowser
 from tkinter import filedialog, messagebox, simpledialog
 from urllib.parse import quote
 
+from md_render import Renderer
+
 APP_NAME = "Markdown Studio"
 
 THEMES = {
@@ -45,9 +47,22 @@ WELCOME = """# Welcome to Markdown Studio
 Select some text and use the toolbar. The Markdown is written for you.
 
 ## Example
-- **Bold**, *italic* and `inline code`
+- **Bold**, *italic*, ***both***, ~~strikethrough~~ and `inline code`
+- Nested lists
+    - indent with Tab
 - [ ] A task to do
 - [x] A finished task
+
+```python
+print("code blocks with a language")
+```
+
+<details>
+<summary>Click to expand</summary>
+
+Collapsible sections work in the preview.
+
+</details>
 
 > [!TIP]
 > Use the Insert menu for templates, badges and alerts.
@@ -57,10 +72,20 @@ Select some text and use the toolbar. The Markdown is written for you.
 | A    | 1     |
 """
 
+SAMPLE_NESTED_LIST = "\n- Item 1\n    - Item 1.1\n        - Item 1.1.1\n        - Item 1.1.2\n    - Item 1.2\n- Item 2\n"
+SAMPLE_HTML_LIST = "\n<ul>\n    <li>Item 1</li>\n    <li>Item 2</li>\n</ul>\n"
+SAMPLE_HTML_NESTED = (
+    "\n<ul>\n    <li>Item 1\n        <ul>\n            <li>Item 1.1</li>\n"
+    "            <li>Item 1.2</li>\n        </ul>\n    </li>\n    <li>Item 2</li>\n</ul>\n")
+SAMPLE_DETAILS_MENU = (
+    "\n<details>\n<summary>Menu Item</summary>\n<ul>\n"
+    "<li><details>\n    <summary>Item 1</summary>\n    <ul>\n        <li>Item 1.1</li>\n"
+    "        <li>Item 1.2</li>\n    </ul>\n</details></li>\n"
+    "<li><details>\n    <summary>Item 2</summary>\n    <ul>\n        <li>Item 2.1</li>\n"
+    "        <li>Item 2.2</li>\n    </ul>\n</details></li>\n</ul>\n</details>\n")
+
 CREDIT_URL = "https://github.com/Raawvie"
 CREDIT_BLUE = {"dark": "#58a6ff", "light": "#0969da"}  # classic link blues
-
-INLINE = re.compile(r"(\*\*.+?\*\*|`.+?`|\*[^*\s][^*]*?\*|_[^_\s][^_]*?_|\[[^\]]+\]\([^)]+\))")
 
 
 def resource_path(name):
@@ -99,10 +124,12 @@ class App(tk.Tk):
         self.layout = tk.StringVar(value="split")
         self.buttons, self.separators = [], []
         self.find_win = None
+        self.last_text = None  # last text pane that had focus (target for Copy/Paste buttons)
 
         self.build_menu()
         self.build_toolbar()
         self.build_panes()
+        self.build_context_menus()
         self.build_footer()
         self.status = tk.Label(self, anchor="w")
         self.status.pack(fill="x", side="bottom")
@@ -129,22 +156,62 @@ class App(tk.Tk):
         edit_m.add_command(label="Undo", accelerator="Ctrl+Z", command=lambda: self.safe_edit("edit_undo"))
         edit_m.add_command(label="Redo", accelerator="Ctrl+Y", command=lambda: self.safe_edit("edit_redo"))
         edit_m.add_separator()
+        edit_m.add_command(label="Cut", accelerator="Ctrl+X", command=self.cut)
+        edit_m.add_command(label="Copy", accelerator="Ctrl+C", command=self.copy)
+        edit_m.add_command(label="Paste", accelerator="Ctrl+V", command=self.paste)
+        edit_m.add_command(label="Select All", accelerator="Ctrl+A", command=self.select_all)
+        edit_m.add_separator()
         edit_m.add_command(label="Find and Replace...", accelerator="Ctrl+F", command=self.open_find)
         edit_m.add_command(label="Copy All Markdown", command=self.copy_all)
         bar.add_cascade(label="Edit", menu=edit_m)
 
         ins_m = tk.Menu(bar, tearoff=0)
+
+        def sub(label, entries):
+            m = tk.Menu(ins_m, tearoff=0)
+            for text, cmd in entries:
+                if text is None:
+                    m.add_separator()
+                else:
+                    m.add_command(label=text, command=cmd)
+            ins_m.add_cascade(label=label, menu=m)
+
         tpl_m = tk.Menu(ins_m, tearoff=0)
         for name in TEMPLATES:
             tpl_m.add_command(label=name, command=lambda n=name: self.from_template(n))
         ins_m.add_cascade(label="New from Template", menu=tpl_m)
+        ins_m.add_separator()
+        sub("Heading", [(f"Heading {n}", lambda n=n: self.set_heading(n)) for n in range(1, 7)]
+            + [(None, None), ("HTML Heading with id...", self.html_heading)])
+        sub("Text Style", [("Bold", self.bold), ("Italic", self.italic), ("Bold + Italic", self.bold_italic),
+                           ("Strikethrough", self.strike), ("Inline Code", self.code)])
+        sub("List", [("Bullet List", lambda: self.prefix("- ")), ("Numbered List", lambda: self.prefix("1. ")),
+                     ("Task List", lambda: self.prefix("- [ ] ")),
+                     ("Nested Bullet List", lambda: self.put(SAMPLE_NESTED_LIST)),
+                     (None, None),
+                     ("Indent (nest deeper)", lambda: self.indent_lines(1)),
+                     ("Outdent", lambda: self.indent_lines(-1)),
+                     (None, None),
+                     ("HTML List", lambda: self.put(SAMPLE_HTML_LIST)),
+                     ("HTML Nested List", lambda: self.put(SAMPLE_HTML_NESTED))])
+        langs = ["", "python", "java", "javascript", "typescript", "bash", "json", "html", "css", "sql", "c", "cpp"]
+        sub("Code Block", [(l or "Plain", lambda l=l: self.code_block(l)) for l in langs]
+            + [(None, None), ("Diff (added / removed lines)", lambda: self.code_block("diff"))])
+        sub("Quote", [("Quote", lambda: self.prefix("> ")), ("Nested Quote", lambda: self.prefix("> > "))])
+        sub("Link", [("Link...", self.link), ("Reference Link...", self.ref_link), ("HTML Link...", self.html_link),
+                     ("Link to a Section (#anchor)...", self.anchor_link)])
+        sub("Image", [("Image...", self.image), ("Linked Image...", self.linked_image),
+                      ("HTML Image...", self.html_image)])
+        ins_m.add_command(label="Table...", command=self.table)
+        ins_m.add_command(label="Horizontal Rule", command=lambda: self.put("\n---\n"))
+        ins_m.add_separator()
         alert_m = tk.Menu(ins_m, tearoff=0)
         for kind in ("NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"):
             alert_m.add_command(label=kind, command=lambda k=kind: self.put(f"\n> [!{k}]\n> Alert text\n"))
         ins_m.add_cascade(label="GitHub Alert", menu=alert_m)
         ins_m.add_command(label="Badge...", command=self.badge)
-        ins_m.add_command(label="Collapsible Section",
-                          command=lambda: self.put("\n<details>\n<summary>Summary</summary>\n\nHidden content\n\n</details>\n"))
+        sub("Collapsible", [("Collapsible Section", self.details),
+                            ("Collapsible Menu (nested)", lambda: self.put(SAMPLE_DETAILS_MENU))])
         bar.add_cascade(label="Insert", menu=ins_m)
 
         view_m = tk.Menu(bar, tearoff=0)
@@ -195,25 +262,35 @@ class App(tk.Tk):
     def build_toolbar(self):
         self.toolbar = tk.Frame(self)
         self.toolbar.pack(fill="x")
-        items = [
-            ("New", self.new), ("Open", self.open_file), ("Save", self.save), None,
-            ("B", self.bold), ("I", self.italic), ("Code", self.code), None,
-            ("H1", lambda: self.prefix("# ")), ("H2", lambda: self.prefix("## ")),
-            ("H3", lambda: self.prefix("### ")), None,
-            ("Bullets", lambda: self.prefix("- ")), ("Numbers", lambda: self.prefix("1. ")),
-            ("Tasks", lambda: self.prefix("- [ ] ")), ("Quote", lambda: self.prefix("> ")), None,
-            ("Link", self.link), ("Image", self.image), ("Table", self.table),
-            ("Rule", lambda: self.put("\n---\n")),
+        rows = [
+            [("New", self.new), ("Open", self.open_file), ("Save", self.save), None,
+             ("Cut", self.cut), ("Copy", self.copy), ("Paste", self.paste), None,
+             ("B", self.bold), ("I", self.italic), ("B+I", self.bold_italic), ("S", self.strike),
+             ("Code", self.code), None,
+             ("H1", lambda: self.set_heading(1)), ("H2", lambda: self.set_heading(2)),
+             ("H3", lambda: self.set_heading(3)), ("H4", lambda: self.set_heading(4)),
+             ("H5", lambda: self.set_heading(5)), ("H6", lambda: self.set_heading(6))],
+            [("Bullets", lambda: self.prefix("- ")), ("Numbers", lambda: self.prefix("1. ")),
+             ("Tasks", lambda: self.prefix("- [ ] ")), ("Indent", lambda: self.indent_lines(1)),
+             ("Outdent", lambda: self.indent_lines(-1)), ("Quote", lambda: self.prefix("> ")), None,
+             ("Link", self.link), ("Image", self.image), ("Table", self.table), None,
+             ("Code Block", lambda: self.code_block("")), ("Diff", lambda: self.code_block("diff")),
+             ("Details", self.details), ("Rule", lambda: self.put("\n---\n"))],
         ]
-        for item in items:
-            if item is None:
-                sep = tk.Frame(self.toolbar, width=1)
-                sep.pack(side="left", fill="y", padx=4, pady=4)
-                self.separators.append(sep)
-            else:
-                btn = tk.Button(self.toolbar, text=item[0], command=item[1], relief="flat", padx=8, bd=0)
-                btn.pack(side="left", pady=3)
-                self.buttons.append(btn)
+        self.toolbar_rows = []
+        for items in rows:
+            row = tk.Frame(self.toolbar)
+            row.pack(fill="x")
+            self.toolbar_rows.append(row)
+            for item in items:
+                if item is None:
+                    sep = tk.Frame(row, width=1)
+                    sep.pack(side="left", fill="y", padx=4, pady=4)
+                    self.separators.append(sep)
+                else:
+                    btn = tk.Button(row, text=item[0], command=item[1], relief="flat", padx=8, bd=0)
+                    btn.pack(side="left", pady=3)
+                    self.buttons.append(btn)
 
     def build_panes(self):
         self.pw = tk.PanedWindow(self, orient="horizontal", sashwidth=5)
@@ -226,11 +303,18 @@ class App(tk.Tk):
         self.pw.add(self.preview, stretch="always")
         self.editor.bind("<KeyRelease>", self.on_edit)
         self.editor.tag_config("found")
+        self.renderer = Renderer(self.preview, rerender=self.refresh, open_url=open_in_chrome_tab)
+        for w in (self.editor, self.preview):
+            w.bind("<FocusIn>", lambda e: setattr(self, "last_text", e.widget))
+        # Tk does not focus a read-only Text on click; do it so Ctrl+C works in the preview.
+        self.preview.bind("<Button-1>", lambda e: e.widget.focus_set(), add="+")
 
     def apply_theme(self):
         c = THEMES[self.theme.get()]
         self.configure(bg=c["bg"])
         self.toolbar.config(bg=c["panel"])
+        for row in self.toolbar_rows:
+            row.config(bg=c["panel"])
         self.pw.config(bg=c["bg"])
         for b in self.buttons:
             b.config(bg=c["panel"], fg=c["fg"], activebackground=c["acc"], activeforeground="white")
@@ -239,17 +323,11 @@ class App(tk.Tk):
         self.editor.config(bg=c["code"], fg=c["fg"], insertbackground=c["fg"],
                            selectbackground=c["acc"], selectforeground="white")
         self.editor.tag_config("found", background=c["found"])
-        p = self.preview
-        p.config(bg=c["panel"], fg=c["fg"])
-        p.tag_config("h1", font=("Segoe UI", 22, "bold"), spacing1=10)
-        p.tag_config("h2", font=("Segoe UI", 17, "bold"), spacing1=8)
-        p.tag_config("h3", font=("Segoe UI", 14, "bold"), spacing1=6)
-        p.tag_config("bold", font=("Segoe UI", 11, "bold"))
-        p.tag_config("italic", font=("Segoe UI", 11, "italic"))
-        p.tag_config("code", font=("Consolas", 11), background=c["code"])
-        p.tag_config("quote", foreground=c["mute"], lmargin1=16, lmargin2=16)
-        p.tag_config("link", foreground=c["link"], underline=True)
-        p.tag_config("label", foreground=c["acc"], font=("Segoe UI", 11, "bold"))
+        self.preview.config(bg=c["panel"], fg=c["fg"], selectbackground=c["acc"], selectforeground="white")
+        self.renderer.configure(c, self.theme.get() == "dark")
+        for m in (self.menu_editor, self.menu_preview):
+            m.config(bg=c["panel"], fg=c["fg"], activebackground=c["acc"], activeforeground="white",
+                     disabledforeground=c["mute"], bd=0)
         self.status.config(bg=c["panel"], fg=c["mute"])
         self.footer.config(bg=c["panel"])
         self.heart.config(bg=c["panel"])
@@ -280,9 +358,28 @@ class App(tk.Tk):
             # Bound on the editor too, so Tk's built-in Emacs-style shortcuts (Ctrl+B, Ctrl+I...) don't fire.
             self.editor.bind(f"<Control-{key}>", handler)
         self.editor.bind("<Control-y>", lambda e: (self.safe_edit("edit_redo"), "break")[1])
+        self.editor.bind("<Tab>", self.on_tab)
+        for seq in ("<Shift-Tab>", "<ISO_Left_Tab>"):  # Shift+Tab is ISO_Left_Tab on Linux
+            try:
+                self.editor.bind(seq, self.on_shift_tab)
+            except tk.TclError:
+                pass
+        # Clipboard shortcuts are handled here and stopped with "break" so Tk's own bindings
+        # never run a second time (that would paste twice). Ctrl+A would otherwise jump to line start.
+        for key, fn in (("c", self.copy), ("x", self.cut), ("v", self.paste), ("a", self.select_all)):
+            for k in (key, key.upper()):  # upper-case too, for Caps Lock
+                handler = lambda e, f=fn: (f(e.widget), "break")[1]
+                self.editor.bind(f"<Control-{k}>", handler)
+                self.preview.bind(f"<Control-{k}>", handler)
 
     # ------------------------------------------------------------- preview
-    def on_edit(self, _event=None):
+    NON_EDIT_KEYS = {"Control_L", "Control_R", "Shift_L", "Shift_R", "Alt_L", "Alt_R", "Caps_Lock",
+                     "Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next"}
+
+    def on_edit(self, event=None):
+        if event is not None and (event.keysym in self.NON_EDIT_KEYS
+                                  or (event.state & 0x4 and event.keysym.lower() in ("c", "a"))):
+            return  # moving the cursor, copying or selecting is not an edit
         self.dirty = True
         if self.timer:
             self.after_cancel(self.timer)
@@ -290,71 +387,19 @@ class App(tk.Tk):
 
     def refresh(self):
         p = self.preview
+        text = self.editor.get("1.0", "end-1c")
+        top = p.yview()[0]  # keep the scroll position while the preview is redrawn
         p.config(state="normal")
         p.delete("1.0", "end")
-        text = self.editor.get("1.0", "end-1c")
-        in_code = False
-        for line in text.split("\n"):
-            if line.strip().startswith("```"):
-                in_code = not in_code
-                continue
-            if in_code:
-                p.insert("end", line + "\n", "code")
-            else:
-                self.render_line(line)
-                p.insert("end", "\n")
+        self.renderer.base_dir = os.path.dirname(self.path) if self.path else None
+        self.renderer.render(text)
         p.config(state="disabled")
+        p.yview_moveto(top)
 
         name = os.path.basename(self.path) if self.path else "Untitled"
         mark = " *" if self.dirty else ""
         self.status.config(text=f"  {len(text.split())} words  |  {len(text)} characters  |  {name}{mark}")
         self.title(f"{name}{mark} - {APP_NAME}")
-
-    def render_line(self, line):
-        p = self.preview
-        if m := re.match(r"(#{1,6})\s+(.*)", line):
-            self.inline(m.group(2), (f"h{min(len(m.group(1)), 3)}",))
-        elif re.fullmatch(r"\s*([-*_])\1{2,}\s*", line):
-            p.insert("end", "\u2500" * 40)
-        elif m := re.match(r">\s?(.*)", line):
-            alert = re.match(r"\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]", m.group(1), re.I)
-            if alert:
-                p.insert("end", alert.group(1).upper(), ("label",))
-            else:
-                self.inline(m.group(1), ("quote",))
-        elif m := re.match(r"(\s*)[-*+]\s+(\[[ xX]\]\s+)?(.*)", line):
-            if m.group(2):
-                mark = "\u2611 " if "x" in m.group(2).lower() else "\u2610 "
-            else:
-                mark = "\u2022 "
-            p.insert("end", "    " * (len(m.group(1)) // 2) + mark)
-            self.inline(m.group(3))
-        elif m := re.match(r"(\s*)(\d+)\.\s+(.*)", line):
-            p.insert("end", "    " * (len(m.group(1)) // 2) + m.group(2) + ". ")
-            self.inline(m.group(3))
-        elif line.strip().startswith("|"):
-            if not re.fullmatch(r"[\s|:-]+", line):
-                cells = [c.strip() for c in line.strip().strip("|").split("|")]
-                p.insert("end", "  \u2502  ".join(cells), ("code",))
-        else:
-            self.inline(line)
-
-    def inline(self, text, tags=()):
-        p = self.preview
-        text = re.sub(r"!\[(.*?)\]\(.*?\)", "[image: \\1]", text)
-        for part in INLINE.split(text):
-            if not part:
-                continue
-            if part.startswith("**") and part.endswith("**") and len(part) > 4:
-                p.insert("end", part[2:-2], tags + ("bold",))
-            elif part.startswith("`") and part.endswith("`") and len(part) > 2:
-                p.insert("end", part[1:-1], tags + ("code",))
-            elif part[0] in "*_" and len(part) > 2 and part[-1] == part[0]:
-                p.insert("end", part[1:-1], tags + ("italic",))
-            elif m := re.fullmatch(r"\[(.*)\]\((.*)\)", part):
-                p.insert("end", m.group(1), tags + ("link",))
-            else:
-                p.insert("end", part, tags)
 
     # ----------------------------------------------------------- formatting
     def wrap(self, before, after, placeholder):
@@ -369,17 +414,67 @@ class App(tk.Tk):
         t.focus_set()
         self.on_edit()
 
-    def prefix(self, text):
+    def selected_lines(self):
         t = self.editor
         if t.tag_ranges("sel"):
             first = int(t.index("sel.first").split(".")[0])
-            last = int(t.index("sel.last").split(".")[0])
+            last_idx = t.index("sel.last").split(".")
+            last = int(last_idx[0])
+            if last_idx[1] == "0" and last > first:
+                last -= 1  # selection ends at the start of a line: that line is not included
         else:
             first = last = int(t.index("insert").split(".")[0])
+        return first, last
+
+    def prefix(self, text):
+        t = self.editor
+        first, last = self.selected_lines()
         for n in range(first, last + 1):
             t.insert(f"{n}.0", text)
         t.focus_set()
         self.on_edit()
+
+    def replace_line(self, n, new):
+        t = self.editor
+        t.delete(f"{n}.0", f"{n}.end")
+        t.insert(f"{n}.0", new)
+
+    def set_heading(self, level):
+        """Make the selected lines a heading of this level (pressing it again removes the heading)."""
+        t = self.editor
+        first, last = self.selected_lines()
+        for n in range(first, last + 1):
+            line = t.get(f"{n}.0", f"{n}.end")
+            m = re.match(r"(#{1,6})(\s+|$)", line)
+            body = line[m.end():] if m else line
+            self.replace_line(n, body if (m and len(m.group(1)) == level) else "#" * level + " " + body)
+        t.focus_set()
+        self.on_edit()
+
+    def indent_lines(self, direction):
+        """Indent (nest deeper) or outdent the selected lines by 4 spaces. Used for nested lists."""
+        t = self.editor
+        first, last = self.selected_lines()
+        for n in range(first, last + 1):
+            line = t.get(f"{n}.0", f"{n}.end")
+            if direction > 0:
+                self.replace_line(n, "    " + line)
+            else:
+                self.replace_line(n, line[1:] if line.startswith("\t") else re.sub(r"^ {1,4}", "", line))
+        t.focus_set()
+        self.on_edit()
+
+    def on_tab(self, _event):
+        t = self.editor
+        line = t.get("insert linestart", "insert lineend")
+        if t.tag_ranges("sel") or re.match(r"\s*([-*+]|\d+[.)])\s", line):
+            self.indent_lines(1)  # Tab nests a list item / indents a selection
+            return "break"
+        return None  # normal Tab character
+
+    def on_shift_tab(self, _event):
+        self.indent_lines(-1)
+        return "break"
 
     def put(self, text):
         self.editor.insert("insert", text)
@@ -394,6 +489,79 @@ class App(tk.Tk):
 
     def code(self):
         self.wrap("`", "`", "code")
+
+    def bold_italic(self):
+        self.wrap("***", "***", "bold italic text")
+
+    def strike(self):
+        self.wrap("~~", "~~", "strikethrough text")
+
+    def code_block(self, lang=""):
+        """Fenced code block with an optional language (python, java, diff ...). Wraps the selection."""
+        t = self.editor
+        if t.tag_ranges("sel"):
+            start, end = t.index("sel.first"), t.index("sel.last")
+            body = t.get(start, end)
+            t.delete(start, end)
+        else:
+            start = t.index("insert")
+            body = "- removed line\n+ added line" if lang == "diff" else "code here"
+        t.insert(start, f"\n```{lang}\n{body}\n```\n")
+        t.focus_set()
+        self.on_edit()
+
+    def details(self):
+        self.put("\n<details>\n<summary>Summary</summary>\n\nHidden content\n\n</details>\n")
+
+    def html_link(self):
+        url = simpledialog.askstring("HTML Link", "URL:", initialvalue="https://", parent=self)
+        if url:
+            self.wrap(f'<a href="{url}">', "</a>", "link text")
+
+    def anchor_link(self):
+        ident = simpledialog.askstring("Link to a Section", "Section id (for example Top-doc or my-heading):",
+                                       parent=self)
+        if ident:
+            self.wrap("[", f"](#{ident.lstrip('#')})", "Go to section")
+
+    def ref_link(self):
+        text = simpledialog.askstring("Reference Link", "Link text:", parent=self)
+        if not text:
+            return
+        ref = simpledialog.askstring("Reference Link", "Reference name:", initialvalue="link", parent=self)
+        url = ref and simpledialog.askstring("Reference Link", "URL:", initialvalue="https://", parent=self)
+        if not url:
+            return
+        self.put(f"[{text}][{ref}]")
+        doc = self.editor.get("1.0", "end-1c")
+        definition = f"[{ref}]: {url}"
+        if definition not in doc:  # the definition goes at the end of the document
+            self.editor.insert("end", ("" if doc.endswith("\n") else "\n") + "\n" + definition + "\n")
+            self.on_edit()
+
+    def linked_image(self):
+        alt = simpledialog.askstring("Linked Image", "Alt text:", parent=self)
+        src = simpledialog.askstring("Linked Image", "Image URL:", initialvalue="https://", parent=self)
+        href = src and simpledialog.askstring("Linked Image", "Link URL (opens on click):",
+                                              initialvalue="https://", parent=self)
+        if href:
+            self.put(f"[![{alt or ''}]({src})]({href})")
+
+    def html_image(self):
+        src = simpledialog.askstring("HTML Image", "Image URL:", initialvalue="https://", parent=self)
+        if not src:
+            return
+        width = simpledialog.askstring("HTML Image", "Width in pixels (optional):", parent=self)
+        size = f' width="{width.strip()}"' if width and width.strip().isdigit() else ""
+        self.put(f'<img src="{src}"{size}/>')
+
+    def html_heading(self):
+        level = simpledialog.askinteger("HTML Heading", "Level (1-6):", initialvalue=1, minvalue=1, maxvalue=6,
+                                        parent=self)
+        ident = level and simpledialog.askstring("HTML Heading", "Section id (used by #links):",
+                                                 initialvalue="Top-doc", parent=self)
+        if ident:
+            self.put(f'\n<h{level} id="{ident}">Heading {level}</h{level}>\n')
 
     def link(self):
         url = simpledialog.askstring("Link", "URL:", initialvalue="https://", parent=self)
@@ -432,6 +600,114 @@ class App(tk.Tk):
             self.on_edit()
         except tk.TclError:
             pass  # nothing to undo/redo
+
+    # ----------------------------------------------------------- clipboard
+    def target(self, widget=None):
+        """The text pane an action applies to: the given one, else the focused one, else the editor."""
+        if widget in (self.editor, self.preview):
+            return widget
+        try:
+            focused = self.focus_get()
+        except KeyError:
+            focused = None
+        if focused in (self.editor, self.preview):
+            return focused
+        return self.last_text or self.editor
+
+    def copy(self, widget=None):
+        w = self.target(widget)
+        if not w.tag_ranges("sel"):
+            return
+        self.clipboard_clear()
+        self.clipboard_append(w.get("sel.first", "sel.last"))
+        self.status.config(text="  Copied to clipboard")
+
+    def cut(self, widget=None):
+        w = self.target(widget)
+        if w is not self.editor or not w.tag_ranges("sel"):
+            return
+        self.copy(w)
+        w.edit_separator()
+        w.delete("sel.first", "sel.last")
+        w.edit_separator()
+        self.on_edit()
+
+    def paste(self, widget=None):
+        w = self.target(widget)
+        if w is not self.editor:
+            return  # the preview is read-only
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            return  # clipboard is empty or holds something that is not text
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        w.edit_separator()
+        if w.tag_ranges("sel"):
+            w.delete("sel.first", "sel.last")  # pasting over a selection replaces it
+        w.insert("insert", text)
+        w.see("insert")
+        w.edit_separator()
+        w.focus_set()
+        self.on_edit()
+
+    def delete_selection(self, widget=None):
+        w = self.target(widget)
+        if w is self.editor and w.tag_ranges("sel"):
+            w.edit_separator()
+            w.delete("sel.first", "sel.last")
+            w.edit_separator()
+            self.on_edit()
+
+    def select_all(self, widget=None):
+        w = self.target(widget)
+        w.tag_remove("sel", "1.0", "end")
+        w.tag_add("sel", "1.0", "end-1c")
+
+    def build_context_menus(self):
+        """Right-click menus for the editor (Cut/Copy/Paste/Delete/Select All) and the preview (Copy/Select All)."""
+        ed, pv = self.editor, self.preview
+        self.menu_editor = tk.Menu(self, tearoff=0)
+        self.menu_editor.add_command(label="Cut", accelerator="Ctrl+X", command=lambda: self.cut(ed))
+        self.menu_editor.add_command(label="Copy", accelerator="Ctrl+C", command=lambda: self.copy(ed))
+        self.menu_editor.add_command(label="Paste", accelerator="Ctrl+V", command=lambda: self.paste(ed))
+        self.menu_editor.add_command(label="Delete", command=lambda: self.delete_selection(ed))
+        self.menu_editor.add_separator()
+        self.menu_editor.add_command(label="Select All", accelerator="Ctrl+A", command=lambda: self.select_all(ed))
+
+        self.menu_preview = tk.Menu(self, tearoff=0)
+        self.menu_preview.add_command(label="Copy", accelerator="Ctrl+C", command=lambda: self.copy(pv))
+        self.menu_preview.add_separator()
+        self.menu_preview.add_command(label="Select All", accelerator="Ctrl+A", command=lambda: self.select_all(pv))
+
+        # Right button is Button-3 on Windows/Linux; on macOS it is Button-2 or Ctrl+click.
+        seqs = ["<Button-3>"] + (["<Button-2>", "<Control-Button-1>"] if sys.platform == "darwin" else [])
+        for widget, menu in ((ed, self.menu_editor), (pv, self.menu_preview)):
+            for seq in seqs:
+                widget.bind(seq, lambda e, m=menu: self.show_context_menu(e, m))
+
+    def show_context_menu(self, event, menu):
+        w = event.widget
+        w.focus_set()
+        has_sel = bool(w.tag_ranges("sel"))
+        if w is self.editor:
+            if not has_sel:
+                w.mark_set("insert", f"@{event.x},{event.y}")  # paste lands where you right-clicked
+            try:
+                has_clip = bool(self.clipboard_get())
+            except tk.TclError:
+                has_clip = False
+            state = lambda ok: "normal" if ok else "disabled"
+            menu.entryconfig(0, state=state(has_sel))   # Cut
+            menu.entryconfig(1, state=state(has_sel))   # Copy
+            menu.entryconfig(2, state=state(has_clip))  # Paste
+            menu.entryconfig(3, state=state(has_sel))   # Delete
+        else:
+            menu.entryconfig(0, state="normal" if has_sel else "disabled")  # Copy
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
 
     def copy_all(self):
         self.clipboard_clear()
@@ -505,6 +781,7 @@ class App(tk.Tk):
         return self.save() if answer else True
 
     def load_text(self, text, path=None):
+        self.renderer.open_details.clear()
         self.editor.delete("1.0", "end")
         self.editor.insert("1.0", text)
         self.editor.edit_reset()
